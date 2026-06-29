@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROXY_USER="proxy3"
+INSTALL_DIR="/usr/bin"
+CFG_DIR="/etc/3proxy"
+LOG_DIR="/var/log/3proxy"
+SERVICE_FILE="/etc/systemd/system/3proxy.service"
+ARCHIVE_URL="https://github.com/3proxy/3proxy/archive/refs/tags/0.9.6.tar.gz"
+
+if [[ $EUID -ne 0 ]]; then
+  echo "Run script as root: sudo bash $0"
+  exit 1
+fi
+
+echo "[1/8] Installing deps..."
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get update
+  apt-get install -y build-essential wget tar
+elif command -v yum >/dev/null 2>&1; then
+  yum install -y gcc make wget tar
+elif command -v dnf >/dev/null 2>&1; then
+  dnf install -y gcc make wget tar
+else
+  echo "Package manager not found (apt/yum/dnf)."
+  exit 1
+fi
+
+echo "[2/8] Creating system user..."
+if ! id "$PROXY_USER" >/dev/null 2>&1; then
+  useradd --system --no-create-home --shell /usr/sbin/nologin "$PROXY_USER"
+fi
+
+echo "[3/8] Downloading archive..."
+TMP_DIR="$(mktemp -d)"
+cd "$TMP_DIR"
+wget -O 3proxy-0.9.6.tar.gz "$ARCHIVE_URL"
+
+echo "[4/8] Extracting..."
+tar -zxvf 3proxy-0.9.6.tar.gz
+SRC_DIR="$(find . -maxdepth 1 -type d -name '3proxy-*' | head -n1)"
+cd "$SRC_DIR"
+
+echo "[5/8] Building..."
+make -f Makefile.Linux
+
+BIN_PATH=""
+for p in build/bin/3proxy bin/3proxy src/3proxy; do
+  if [[ -f "$p" ]]; then
+    BIN_PATH="$p"
+    break
+  fi
+done
+
+if [[ -z "$BIN_PATH" ]]; then
+  echo "Unable to find binary 3proxy."
+  exit 1
+fi
+
+echo "[6/8] Setting up the binary..."
+cp -f "$BIN_PATH" "$INSTALL_DIR/3proxy"
+chmod 755 "$INSTALL_DIR/3proxy"
+
+echo "[7/8] Creating config and logs..."
+mkdir -p "$CFG_DIR" "$LOG_DIR"
+touch "$LOG_DIR/3proxy.log"
+chown -R "$PROXY_USER:$PROXY_USER" "$LOG_DIR"
+chmod 750 "$LOG_DIR"
+
+cat > "$CFG_DIR/3proxy.cfg" <<'EOF'
+daemon
+nserver 1.1.1.1
+nserver 8.8.8.8
+nscache 65536
+log /var/log/3proxy/3proxy.log D
+auth none
+allow *
+socks -p1080
+EOF
+
+cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=3proxy Proxy Server
+After=network.target
+
+[Service]
+Type=simple
+User=$PROXY_USER
+Group=$PROXY_USER
+ExecStart=$INSTALL_DIR/3proxy $CFG_DIR/3proxy.cfg
+ExecStop=/bin/kill `/usr/bin/pgrep -u proxy3`
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "[8/8] Starting service..."
+systemctl daemon-reload
+systemctl enable 3proxy
+systemctl restart 3proxy
+systemctl --no-pager status 3proxy || true
+
+echo "Done."
+echo "Checking: systemctl status 3proxy"
+echo "Config: $CFG_DIR/3proxy.cfg"
+echo "Logs: $LOG_DIR/3proxy.log"
